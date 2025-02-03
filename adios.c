@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.1.0"
+#define ADIOS_VERSION "1.5.2"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -50,10 +50,15 @@ static u64 default_latency_target[ADIOS_OPTYPES] = {
 
 // Maximum batch size limits for each operation type
 static u32 default_batch_limit[ADIOS_OPTYPES] = {
-	[ADIOS_READ]    = 16,
-	[ADIOS_WRITE]   =  8,
+	[ADIOS_READ]    = 24,
+	[ADIOS_WRITE]   = 48,
 	[ADIOS_DISCARD] =  1,
 	[ADIOS_OTHER]   =  1,
+};
+
+static u32 default_dl_prio[2] = {
+	[0] = 5,
+	[1] = 0,
 };
 
 // Thresholds for latency model control
@@ -102,8 +107,11 @@ struct adios_data {
 	spinlock_t pq_lock;
 	struct list_head prio_queue;
 
-	struct rb_root_cached dl_tree;
+	struct rb_root_cached dl_tree[2];
 	spinlock_t lock;
+	u8  dl_queued;
+	s64 dl_bias;
+	s32 dl_prio[2];
 
 	u64 global_latency_window;
 	u64 latency_target[ADIOS_OPTYPES];
@@ -145,6 +153,17 @@ struct adios_rq_data {
 	u64 pred_lat;
 	u32 block_size;
 } __attribute__((aligned(64)));
+
+static const int adios_prio_to_weight[40] = {
+ /* -20 */     88761,     71755,     56483,     46273,     36291,
+ /* -15 */     29154,     23254,     18705,     14949,     11916,
+ /* -10 */      9548,      7620,      6100,      4904,      3906,
+ /*  -5 */      3121,      2501,      1991,      1586,      1277,
+ /*   0 */      1024,       820,       655,       526,       423,
+ /*   5 */       335,       272,       215,       172,       137,
+ /*  10 */       110,        87,        70,        56,        45,
+ /*  15 */        36,        29,        23,        18,        15,
+};
 
 // Count the number of entries in small buckets
 static u32 lm_count_small_entries(struct latency_model *model) {
@@ -432,14 +451,19 @@ static u8 adios_optype(struct request *rq) {
 	}
 }
 
+static inline u8 adios_optype_not_read(struct request *rq) {
+	return (rq->cmd_flags & REQ_OP_MASK) != REQ_OP_READ;
+}
+
 // Helper function to retrieve adios_rq_data from a request
 static inline struct adios_rq_data *get_rq_data(struct request *rq) {
 	return (struct adios_rq_data *)rq->elv.priv[0];
 }
 
 // Add a request to the deadline-sorted red-black tree
-static void add_to_dl_tree(struct adios_data *ad, struct request *rq) {
-	struct rb_root_cached *root = &ad->dl_tree;
+static void add_to_dl_tree(
+		struct adios_data *ad, bool dl_idx, struct request *rq) {
+	struct rb_root_cached *root = &ad->dl_tree[dl_idx];
 	struct rb_node **link = &(root->rb_root.rb_node), *parent = NULL;
 	bool leftmost = true;
 	struct adios_rq_data *rd = get_rq_data(rq);
@@ -480,11 +504,13 @@ static void add_to_dl_tree(struct adios_data *ad, struct request *rq) {
 found:
 	list_add_tail(&rd->dl_node, &dlg->rqs);
 	rd->dl_group = &dlg->rqs;
+	ad->dl_queued |= 1 << dl_idx;
 }
 
 // Remove a request from the deadline-sorted red-black tree
-static void del_from_dl_tree(struct adios_data *ad, struct request *rq) {
-	struct rb_root_cached *root = &ad->dl_tree;
+static void del_from_dl_tree(
+		struct adios_data *ad, bool dl_idx, struct request *rq) {
+	struct rb_root_cached *root = &ad->dl_tree[dl_idx];
 	struct adios_rq_data *rd = get_rq_data(rq);
 	struct dl_group *dlg = container_of(rd->dl_group, struct dl_group, rqs);
 
@@ -494,10 +520,14 @@ static void del_from_dl_tree(struct adios_data *ad, struct request *rq) {
 		kmem_cache_free(ad->dl_group_pool, dlg);
 	}
 	rd->dl_group = NULL;
+
+	if (RB_EMPTY_ROOT(&ad->dl_tree[dl_idx].rb_root))
+		ad->dl_queued &= ~(1 << dl_idx);
 }
 
 // Remove a request from the scheduler
 static void remove_request(struct adios_data *ad, struct request *rq) {
+	bool dl_idx = adios_optype_not_read(rq);
 	struct request_queue *q = rq->q;
 	struct adios_rq_data *rd = get_rq_data(rq);
 
@@ -505,7 +535,7 @@ static void remove_request(struct adios_data *ad, struct request *rq) {
 
 	// We might not be on the rbtree, if we are doing an insert merge
 	if (rd->dl_group)
-		del_from_dl_tree(ad, rq);
+		del_from_dl_tree(ad, dl_idx, rq);
 
 	elv_rqhash_del(q, rq);
 	if (q->last_merge == rq)
@@ -545,12 +575,13 @@ static void adios_depth_updated(struct blk_mq_hw_ctx *hctx) {
 // Handle request merging after a merge operation
 static void adios_request_merged(struct request_queue *q, struct request *req,
 				  enum elv_merge type) {
+	bool dl_idx = adios_optype_not_read(req);
 	struct adios_data *ad = q->elevator->elevator_data;
 
 	// if the merge was a front merge, we need to reposition request
 	if (type == ELEVATOR_FRONT_MERGE) {
-		del_from_dl_tree(ad, req);
-		add_to_dl_tree(ad, req);
+		del_from_dl_tree(ad, dl_idx, req);
+		add_to_dl_tree(ad, dl_idx, req);
 	}
 }
 
@@ -587,6 +618,7 @@ static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 static void insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 				  blk_insert_t insert_flags, struct list_head *free) {
 	unsigned long flags;
+	bool dl_idx = adios_optype_not_read(rq);
 	struct request_queue *q = hctx->queue;
 	struct adios_data *ad = q->elevator->elevator_data;
 
@@ -602,7 +634,7 @@ static void insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	if (blk_mq_sched_try_insert_merge(q, rq, free))
 		return;
 
-	add_to_dl_tree(ad, rq);
+	add_to_dl_tree(ad, dl_idx, rq);
 
 	if (rq_mergeable(rq)) {
 		elv_rqhash_add(q, rq);
@@ -650,17 +682,50 @@ static void adios_prepare_request(struct request *rq) {
 	rq->elv.priv[0] = rd;
 }
 
-// Select the next request to dispatch from the deadline-sorted red-black tree
-static struct request *get_ealiest_request(struct adios_data *ad) {
-	struct rb_root_cached *root = &ad->dl_tree;
+static struct adios_rq_data *get_dl_first_rd(struct adios_data *ad, bool idx) {
+	struct rb_root_cached *root = &ad->dl_tree[idx];
 	struct rb_node *first = rb_first_cached(root);
-
-	if (!first)
-		return NULL;
-
 	struct dl_group *dl_group = rb_entry(first, struct dl_group, node);
 	struct adios_rq_data *rd =
 		list_first_entry(&dl_group->rqs, struct adios_rq_data, dl_node);
+
+	return rd;
+}
+
+// Select the next request to dispatch from the deadline-sorted red-black tree
+static struct request *next_request(struct adios_data *ad) {
+	struct adios_rq_data *rd;
+	bool dl_idx, bias_idx, reduce_bias;
+
+	if (!ad->dl_queued)
+		return NULL;
+
+	dl_idx = ad->dl_queued >> 1;
+	rd = get_dl_first_rd(ad, dl_idx);
+
+	bias_idx = ad->dl_bias < 0;
+	reduce_bias = (bias_idx == dl_idx);
+
+	if (ad->dl_queued == 0x3) {
+		struct adios_rq_data *trd[2];
+		trd[0] = get_dl_first_rd(ad, 0);
+		trd[1] = rd;
+
+		rd = trd[bias_idx];
+
+		reduce_bias =
+			(trd[bias_idx]->deadline > trd[((u8)bias_idx + 1) % 2]->deadline);
+	}
+
+	if (reduce_bias) {
+		s64 sign = ((int)bias_idx << 1) - 1;
+		if (unlikely(!rd->pred_lat))
+			ad->dl_bias = sign;
+		else {
+			ad->dl_bias += sign * (s64)((rd->pred_lat *
+				adios_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
+		}
+	}
 
 	return rd->rq;
 }
@@ -692,7 +757,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 
 	spin_lock_irqsave(&ad->lock, flags);
 	while (true) {
-		struct request *rq = get_ealiest_request(ad);
+		struct request *rq = next_request(ad);
 		if (!rq)
 			break;
 
@@ -848,7 +913,7 @@ static inline bool bq_has_work(struct adios_data *ad) {
 
 static inline bool dl_tree_has_work(struct adios_data *ad) {
 	guard(spinlock_irqsave)(&ad->lock);
-	return !RB_EMPTY_ROOT(&ad->dl_tree.rb_root);
+	return ad->dl_queued;
 }
 
 // Check if there are any requests available for dispatch
@@ -902,7 +967,12 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
 
 	INIT_LIST_HEAD(&ad->prio_queue);
-	ad->dl_tree = RB_ROOT_CACHED;
+	for (u8 i = 0; i < 2; i++)
+		ad->dl_tree[i] = RB_ROOT_CACHED;
+	ad->dl_bias = 0;
+	ad->dl_queued = 0x0;
+	for (u8 i = 0; i < 2; i++)
+		ad->dl_prio[i] = default_dl_prio[i];
 
 	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
 		struct latency_model *model = &ad->latency_model[i];
@@ -1068,6 +1138,31 @@ static ssize_t adios_bq_refill_below_ratio_store(
 	return count;
 }
 
+// Show the read priority
+static ssize_t adios_read_priority_show(
+		struct elevator_queue *e, char *page) {
+	struct adios_data *ad = e->elevator_data;
+	return sprintf(page, "%d\n", ad->dl_prio[0]);
+}
+
+// Set the read priority
+static ssize_t adios_read_priority_store(
+		struct elevator_queue *e, const char *page, size_t count) {
+	struct adios_data *ad = e->elevator_data;
+	int prio;
+	int ret;
+
+	ret = kstrtoint(page, 10, &prio);
+	if (ret || prio < -20 || prio > 19)
+		return -EINVAL;
+
+	guard(spinlock_irqsave)(&ad->lock);
+	ad->dl_prio[0] = prio;
+	ad->dl_bias = 0;
+
+	return count;
+}
+
 // Reset batch queue statistics
 static ssize_t adios_reset_bq_stats_store(
 		struct elevator_queue *e, const char *page, size_t count) {
@@ -1146,6 +1241,8 @@ static struct elv_fs_entry adios_sched_attrs[] = {
 	AD_ATTR_RW(lat_target_read),
 	AD_ATTR_RW(lat_target_write),
 	AD_ATTR_RW(lat_target_discard),
+
+    AD_ATTR_RW(read_priority),
 
 	AD_ATTR_WO(reset_bq_stats),
 	AD_ATTR_WO(reset_lat_model),

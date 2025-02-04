@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.5.2"
+#define ADIOS_VERSION "1.5.3"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -39,6 +39,11 @@ enum adios_op_type {
 static u64 default_global_latency_window = 16000000ULL;
 // Ratio below which batch queues should be refilled
 static u8  default_bq_refill_below_ratio = 15;
+
+// Dynamic thresholds for shrinkage
+static u32 default_lm_shrink_at_kreqs  = 10000;
+static u32 default_lm_shrink_at_gbytes =   100;
+static u32 default_lm_shrink_resist    =     2;
 
 // Latency targets for each operation type
 static u64 default_latency_target[ADIOS_OPTYPES] = {
@@ -57,7 +62,7 @@ static u32 default_batch_limit[ADIOS_OPTYPES] = {
 };
 
 static u32 default_dl_prio[2] = {
-	[0] = 5,
+	[0] = 7,
 	[1] = 0,
 };
 
@@ -67,9 +72,6 @@ static u32 default_dl_prio[2] = {
 #define LM_INTERVAL_THRESHOLD   1500
 #define LM_OUTLIER_PERCENTILE     99
 #define LM_LAT_BUCKET_COUNT       64
-#define LM_SHRINK_AT_MREQ         10
-#define LM_SHRINK_AT_GBYTES      100
-#define LM_SHRINK_RESIST           2
 
 // Structure to hold latency bucket data for small requests
 struct latency_bucket_small {
@@ -98,6 +100,10 @@ struct latency_model {
 	spinlock_t buckets_lock;
 	struct latency_bucket_small small_bucket[LM_LAT_BUCKET_COUNT];
 	struct latency_bucket_large large_bucket[LM_LAT_BUCKET_COUNT];
+
+	u32 lm_shrink_at_kreqs;
+	u32 lm_shrink_at_gbytes;
+	u8  lm_shrink_resist;
 };
 
 #define ADIOS_BQ_PAGES 2
@@ -217,8 +223,8 @@ static bool lm_update_small_buckets(struct latency_model *model,
 	}
 
 	// Shrink the model if it reaches at the readjustment threshold
-	if (model->small_count >= 1000000ULL * LM_SHRINK_AT_MREQ) {
-		reduction = LM_SHRINK_RESIST;
+	if (model->small_count >= 1000ULL * model->lm_shrink_at_kreqs) {
+		reduction = model->lm_shrink_resist;
 		if (model->small_count >> reduction) {
 			model->small_sum_delay -= model->small_sum_delay >> reduction;
 			model->small_count     -= model->small_count     >> reduction;
@@ -290,8 +296,8 @@ static bool lm_update_large_buckets(
 	}
 
 	// Shrink the model if it reaches at the readjustment threshold
-	if (model->large_sum_bsize >= 0x40000000ULL * LM_SHRINK_AT_GBYTES) {
-		reduction = LM_SHRINK_RESIST;
+	if (model->large_sum_bsize >= 0x40000000ULL * model->lm_shrink_at_gbytes) {
+		reduction = model->lm_shrink_resist;
 		if (model->large_sum_bsize >> reduction) {
 			model->large_sum_delay -= model->large_sum_delay >> reduction;
 			model->large_sum_bsize -= model->large_sum_bsize >> reduction;
@@ -983,6 +989,9 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 		memset(model->large_bucket, 0,
 			sizeof(model->large_bucket[0]) * LM_LAT_BUCKET_COUNT);
 		model->last_update_jiffies = jiffies;
+		model->lm_shrink_at_kreqs  = default_lm_shrink_at_kreqs;
+		model->lm_shrink_at_gbytes = default_lm_shrink_at_gbytes;
+		model->lm_shrink_resist    = default_lm_shrink_resist;
 
 		ad->latency_target[i] = default_latency_target[i];
 		ad->batch_limit[i] = default_batch_limit[i];
@@ -1214,6 +1223,43 @@ static ssize_t adios_version_show(struct elevator_queue *e, char *page) {
 	return sprintf(page, "%s\n", ADIOS_VERSION);
 }
 
+// Define sysfs attributes for dynamic thresholds
+#define SHRINK_THRESHOLD_ATTR_RW(name, model_field, min_value, max_value) \
+static ssize_t adios_shrink_##name##_store( \
+		struct elevator_queue *e, const char *page, size_t count) { \
+	struct adios_data *ad = e->elevator_data; \
+	unsigned long val; \
+	int ret; \
+	ret = kstrtoul(page, 10, &val); \
+	if (ret || val < min_value || val > max_value) \
+		return -EINVAL; \
+	for (u8 i = 0; i < ADIOS_OPTYPES; i++) { \
+		struct latency_model *model = &ad->latency_model[i]; \
+		unsigned long flags; \
+		spin_lock_irqsave(&model->lock, flags); \
+		model->model_field = val; \
+		spin_unlock_irqrestore(&model->lock, flags); \
+	} \
+	return count; \
+} \
+static ssize_t adios_shrink_##name##_show( \
+		struct elevator_queue *e, char *page) { \
+	struct adios_data *ad = e->elevator_data; \
+	u32 val = 0; \
+	for (u8 i = 0; i < ADIOS_OPTYPES; i++) { \
+		struct latency_model *model = &ad->latency_model[i]; \
+		unsigned long flags; \
+		spin_lock_irqsave(&model->lock, flags); \
+		val = model->model_field; \
+		spin_unlock_irqrestore(&model->lock, flags); \
+	} \
+	return sprintf(page, "%u\n", val); \
+}
+
+SHRINK_THRESHOLD_ATTR_RW(at_kreqs,  lm_shrink_at_kreqs,  1, 100000)
+SHRINK_THRESHOLD_ATTR_RW(at_gbytes, lm_shrink_at_gbytes, 1,   1000)
+SHRINK_THRESHOLD_ATTR_RW(resist,    lm_shrink_resist,    1,      3)
+
 // Define sysfs attributes
 #define AD_ATTR(name, show_func, store_func) \
 	__ATTR(name, 0644, show_func, store_func)
@@ -1242,7 +1288,11 @@ static struct elv_fs_entry adios_sched_attrs[] = {
 	AD_ATTR_RW(lat_target_write),
 	AD_ATTR_RW(lat_target_discard),
 
-    AD_ATTR_RW(read_priority),
+	AD_ATTR_RW(shrink_at_kreqs),
+	AD_ATTR_RW(shrink_at_gbytes),
+	AD_ATTR_RW(shrink_resist),
+
+	AD_ATTR_RW(read_priority),
 
 	AD_ATTR_WO(reset_bq_stats),
 	AD_ATTR_WO(reset_lat_model),
